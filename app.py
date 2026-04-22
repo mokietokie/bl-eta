@@ -10,7 +10,7 @@ from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 
-from bl_eta import db, export, tracker
+from bl_eta import db, export, tracker, vesselfinder
 
 db.init_db()
 
@@ -30,10 +30,15 @@ if "_refresh_done" in st.session_state:
 
     @st.dialog("새로고침 완료")
     def _done_dialog():
-        st.markdown(f"**{_info['n']}건** 갱신 완료")
+        st.markdown(f"**ETA {_info['n']}건** 갱신 완료")
         st.write(f"- ✓ 완료: {_info['ok']}")
         st.write(f"- ✗ 없음(not_found): {_info['nf']}")
         st.write(f"- ✗ 실패: {_info['failed']}")
+        if "loc_n" in _info:
+            st.markdown(f"**위치 {_info['loc_n']}건** 갱신 완료")
+            st.write(f"- ✓ 완료: {_info['loc_ok']}")
+            st.write(f"- ✗ 없음: {_info['loc_nf']}")
+            st.write(f"- ✗ 실패: {_info['loc_failed']}")
         if st.button("확인", type="primary", use_container_width=True):
             del st.session_state["_refresh_done"]
             st.rerun()
@@ -180,6 +185,68 @@ def run_master_refresh_inplace(slot, bl_list: list[str], headless: bool, concurr
     redraw()
     progress_bar.progress(1.0)
     status_slot.text(f"{state['done']}/{total} 완료")
+
+    if "e" in err_holder:
+        raise err_holder["e"]
+    return results_holder.get("r", [])
+
+
+def run_location_refresh_inplace(
+    slot, vessels: list[str], headless: bool, concurrency: int
+) -> list[dict]:
+    """선명 리스트 → VesselFinder 위치 병렬 조회. 진행 상황은 `slot`에 인플레이스 렌더."""
+    base = build_master_df().drop(columns=[SELECT_HEADER]).copy()
+    base.insert(0, "위치 진행", "진행중")
+    slot.dataframe(base, use_container_width=True, hide_index=True)
+
+    progress_bar = st.progress(0.0)
+    status_slot = st.empty()
+    total = len(vessels)
+    state: dict = {"done": 0, "per_vessel": {}}
+
+    def on_progress(done: int, total_: int, vessel: str, rec: dict) -> None:
+        state["done"] = done
+        status = rec.get("status", "")
+        label = rec.get("location_label")
+        if status == "ok" and label:
+            state["per_vessel"][vessel] = label
+        elif status == "not_found":
+            state["per_vessel"][vessel] = "✗ 없음"
+        else:
+            state["per_vessel"][vessel] = "✗ 실패"
+
+    results_holder: dict[str, list[dict]] = {}
+    err_holder: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            results_holder["r"] = asyncio.run(
+                vesselfinder.track_many_locations(
+                    vessels,
+                    headless=headless,
+                    concurrency=concurrency,
+                    on_progress=on_progress,
+                )
+            )
+        except BaseException as e:
+            err_holder["e"] = e
+
+    def redraw() -> None:
+        for v, s in state["per_vessel"].items():
+            base.loc[base["선명"] == v, "위치 진행"] = s
+        slot.dataframe(base, use_container_width=True, hide_index=True)
+        done = state["done"]
+        progress_bar.progress(done / total if total else 1.0)
+        status_slot.text(f"위치 {done}/{total} 조회 중…")
+
+    th = threading.Thread(target=runner, daemon=True)
+    th.start()
+    while th.is_alive():
+        redraw()
+        th.join(timeout=0.4)
+    redraw()
+    progress_bar.progress(1.0)
+    status_slot.text(f"위치 {state['done']}/{total} 완료")
 
     if "e" in err_holder:
         raise err_holder["e"]
@@ -440,7 +507,9 @@ edited = master_slot.data_editor(
             help="track-trace 조회 결과 (YYYY-MM-DD)",
         ),
         "전일 대비 변동": st.column_config.TextColumn(disabled=True, help="D±n / 변동없음 (오늘 이전 최신 ETA 대비)"),
-        CARGO_HEADER: st.column_config.TextColumn(help="화물 위치 (자동 조회는 추후 연동)"),
+        CARGO_HEADER: st.column_config.TextColumn(
+            help="새로고침 시 선명 기반 VesselFinder 조회 결과로 자동 갱신",
+        ),
     },
     key="shipments_editor",
 )
@@ -492,24 +561,55 @@ if refresh_clicked:
         st.error(f"저장 실패 (BL 중복): {e}")
         st.stop()
 
-    bls = [r["bl_no"] for r in db.shipments_all() if r.get("bl_no")]
-    if not bls:
-        st.warning("마스터에 BL이 없습니다.")
+    shipments = db.shipments_all()
+    bls = [r["bl_no"] for r in shipments if r.get("bl_no")]
+    vessels = list(dict.fromkeys(
+        r["vessel"] for r in shipments if r.get("vessel")
+    ))
+    if not bls and not vessels:
+        st.warning("마스터에 BL/선명이 없습니다.")
     else:
-        try:
-            results = run_master_refresh_inplace(
-                master_slot, bls, headless=not headed, concurrency=concurrency
-            )
-        except Exception as e:
-            st.error(f"조회 실패: {type(e).__name__}: {e}")
-            st.stop()
-        for r in results:
-            db.save_record(r)
+        # 1단계: BL → ETA 조회
+        results: list[dict] = []
+        if bls:
+            try:
+                results = run_master_refresh_inplace(
+                    master_slot, bls, headless=not headed, concurrency=concurrency
+                )
+            except Exception as e:
+                st.error(f"ETA 조회 실패: {type(e).__name__}: {e}")
+                st.stop()
+            for r in results:
+                db.save_record(r)
+
+        # 2단계: 선명 → 위치 조회
+        loc_results: list[dict] = []
+        if vessels:
+            try:
+                loc_results = run_location_refresh_inplace(
+                    master_slot, vessels, headless=not headed, concurrency=concurrency
+                )
+            except Exception as e:
+                st.error(f"위치 조회 실패: {type(e).__name__}: {e}")
+                st.stop()
+            mapping = {
+                r["vessel"]: r["location_label"]
+                for r in loc_results
+                if r.get("status") == "ok" and r.get("location_label")
+            }
+            if mapping:
+                db.update_cargo_locations(mapping)
+
         ok = sum(1 for r in results if r["status"] == "ok")
         nf = sum(1 for r in results if r["status"] == "not_found")
         failed = sum(1 for r in results if r["status"] == "failed")
+        loc_ok = sum(1 for r in loc_results if r["status"] == "ok")
+        loc_nf = sum(1 for r in loc_results if r["status"] == "not_found")
+        loc_failed = sum(1 for r in loc_results if r["status"] == "failed")
         st.session_state["_refresh_done"] = {
             "n": len(results), "ok": ok, "nf": nf, "failed": failed,
+            "loc_n": len(loc_results), "loc_ok": loc_ok,
+            "loc_nf": loc_nf, "loc_failed": loc_failed,
         }
         st.rerun()
 

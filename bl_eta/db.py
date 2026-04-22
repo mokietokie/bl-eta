@@ -273,6 +273,33 @@ def _to_float(v: Any) -> float | None:
         return None
 
 
+def update_cargo_locations(
+    mapping: dict[str, str], db_path: Path | None = None
+) -> int:
+    """vessel 이름 → cargo_location 일괄 업데이트. 업데이트된 행 수 반환.
+
+    동일 vessel로 여러 shipment 행이 있으면 모두 같은 값으로 갱신된다.
+    """
+    if not mapping:
+        return 0
+    _ensure_init()
+    conn = _connect(db_path)
+    total = 0
+    try:
+        for vessel, loc in mapping.items():
+            if not vessel:
+                continue
+            cur = conn.execute(
+                "UPDATE shipments SET cargo_location = ? WHERE vessel = ?",
+                (loc, vessel),
+            )
+            total += cur.rowcount or 0
+        conn.commit()
+    finally:
+        conn.close()
+    return total
+
+
 def get_recent(limit: int = 100, db_path: Path | None = None) -> list[dict[str, Any]]:
     """최근 queried_at 내림차순 레코드 목록. 사이드바 DB 뷰어용."""
     _ensure_init()
