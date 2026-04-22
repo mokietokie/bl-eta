@@ -76,6 +76,13 @@ ship/
 ### 동시성
 - 기본 `asyncio.Semaphore(5)`. 사이드바에서 1~10 조절.
 - 403/429 관찰 시 즉시 축소.
+- **병렬 패턴 (`tracker.track_many`)**: 단일 `pw.chromium.launch` + 단일 `browser` 공유, **BL마다 별도 `BrowserContext`** 생성(HMM fullscreen 새 탭 캡처가 context-scoped `expect_page`에 의존하므로 격리 필수). 결과는 입력 인덱스 보존(`results[idx] = rec`). 진행률은 `on_progress(done, total, bl, rec)` 콜백.
+- **Streamlit ↔ asyncio 브릿지**: `app.py`는 `threading.Thread` 내부에서 `asyncio.run(track_many(...))` 호출 — Streamlit 메인 루프와 이벤트 루프 충돌 회피. 메인 쓰레드는 `state["done"]` polling으로 `st.progress` 갱신.
+
+### UI 레이아웃
+- **사이드바**: Headed 토글(**기본 ON** — `docs/carrier-samples.md`: Maersk headless 감지 회피), 동시성 슬라이더(1~10, 기본 5), DB 초기화 버튼(`db.reset()` 연결).
+- **메인**: `st.text_area` BL 입력(줄바꿈 구분, 중복 제거) → `조회 시작` → `st.progress` + `n/m 조회 중…` 카운터 → 결과 `st.dataframe`(change/변동일수/BL/선사/항구/이전 ETA/ETA/status) + ok/not_found/failed/CHANGED/NEW 요약 + failed>0 시 경고 배너 + CSV·엑셀 다운로드 버튼 + raw_text expander.
+- **결과 캐시**: 조회 결과는 `st.session_state["last_run"]`에 저장 — 다운로드 버튼 클릭으로 rerun돼도 결과·테이블 유지.
 
 ### 데이터 스키마 (bl_eta.db)
 ```sql
@@ -96,7 +103,12 @@ CREATE INDEX idx_bl_queried ON eta_history(bl_no, queried_at DESC);
 - `NEW` (이전 기록 없음) → 파랑
 - `UNCHANGED` (ETA 동일) → 회색
 - `CHANGED` (ETA 다름) → 빨강 + 이전/신규 ETA 병기, 테이블 **상단 정렬**
+- `변동일수` 컬럼: CHANGED일 때만 `D±n` 표기 (curr-prev 일수 차), 파싱 실패/빈값은 `""`. 계산은 `app.py:_delta_str`.
 - "어제"의 정의는 **직전 `queried_at` 1건 기준** (MVP)
+
+### Export
+- `bl_eta/export.py`의 `to_csv(df) -> bytes` / `to_xlsx(df) -> bytes`만 사용. CSV는 UTF-8 **BOM 포함**(Excel 한글 깨짐 방지), xlsx는 openpyxl로 헤더 굵게 + 컬럼 폭 auto(8~40) + A2 freeze.
+- 파일명 규칙: `bl_eta_YYYY-MM-DD.{csv,xlsx}` (`date.today().isoformat()`).
 
 ### 실패 처리
 - 부산/인천 미발견 → `status="not_found"`, `eta=NULL`
@@ -129,4 +141,4 @@ CREATE INDEX idx_bl_queried ON eta_history(bl_no, queried_at DESC);
 ## Phase 진행 상황
 
 진행 중인 Phase와 다음 태스크는 `todo.md`를 단일 출처로 삼는다.
-현재: **Phase 0 — 프로젝트 세팅 (진행 중)**
+현재: **Phase 4 — CSV/엑셀 export + 마감 (구현 완료, Gate 검증 대기)**
