@@ -1,8 +1,9 @@
-"""bl-eta Streamlit app (Phase 4 — 병렬 조회 + SQLite 변동 감지 + export)."""
+"""bl-eta Streamlit app — 선적 마스터 + 병렬 조회 + SQLite 변동 감지 + export."""
 
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import threading
 from datetime import date, datetime
 
@@ -18,10 +19,26 @@ st.title("bl-eta")
 st.caption("track-trace.com 병렬 BL 조회 — 부산/인천 ETA + 전일 대비 변동 감지")
 
 
+# ─── 새로고침 완료 모달 ─────────────────────────────────────────────────
+if "_refresh_done" in st.session_state:
+    _info = st.session_state["_refresh_done"]
+
+    @st.dialog("새로고침 완료")
+    def _done_dialog():
+        st.markdown(f"**{_info['n']}건** 갱신 완료")
+        st.write(f"- ✓ 완료: {_info['ok']}")
+        st.write(f"- ✗ 없음(not_found): {_info['nf']}")
+        st.write(f"- ✗ 실패: {_info['failed']}")
+        if st.button("확인", type="primary", use_container_width=True):
+            del st.session_state["_refresh_done"]
+            st.rerun()
+
+    _done_dialog()
+
+
 # ─── 사이드바 ────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("설정")
-    # docs/carrier-samples.md: Maersk headless 감지 → 기본 Headed
     headed = st.toggle(
         "Headed 모드 (브라우저 창 표시)",
         value=True,
@@ -32,35 +49,25 @@ with st.sidebar:
     if st.button("DB 초기화", help="eta_history 전체 삭제 (되돌릴 수 없음)"):
         db.reset()
         st.success("DB 초기화 완료")
+    st.caption(f"DB 파일: `{db.DB_PATH}`")
+
+    with st.expander("DB 내역 (최근 100건)"):
+        recent = db.get_recent(limit=100)
+        if recent:
+            st.caption(f"{len(recent)}건")
+            st.dataframe(
+                pd.DataFrame(recent),
+                use_container_width=True,
+                hide_index=True,
+                height=320,
+            )
+        else:
+            st.caption("아직 조회 기록이 없습니다.")
 
 
-# ─── 메인: 입력 ──────────────────────────────────────────────────────────
-st.subheader("1. BL 번호 입력")
-raw = st.text_area(
-    "BL 번호를 줄바꿈으로 구분해 붙여넣기",
-    height=180,
-    placeholder="MAEU266930123\nHDMUDOHA62608100\n...",
-)
-run_clicked = st.button("조회 시작", type="primary", disabled=not raw.strip())
-
-
-# ─── 병렬 조회 + 진행률 ─────────────────────────────────────────────────
-def parse_bls(text: str) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for line in text.splitlines():
-        bl = line.strip()
-        if bl and bl not in seen:
-            seen.add(bl)
-            out.append(bl)
-    return out
-
-
+# ─── 공용 유틸 ───────────────────────────────────────────────────────────
 def run_sync(bl_list: list[str], headless: bool, concurrency: int) -> list[dict]:
-    """Streamlit은 동기 컨텍스트 → 별도 쓰레드에서 asyncio.run.
-
-    Streamlit 쓰레드가 이미 이벤트 루프를 들고 있을 수 있어 nested loop 방지.
-    """
+    """Streamlit은 동기 컨텍스트 → 별도 쓰레드에서 asyncio.run."""
     progress_bar = st.progress(0.0)
     status_slot = st.empty()
     total = len(bl_list)
@@ -68,8 +75,6 @@ def run_sync(bl_list: list[str], headless: bool, concurrency: int) -> list[dict]
 
     def on_progress(done: int, total_: int, bl: str, rec: dict) -> None:
         state["done"] = done
-        # 콜백은 worker 쓰레드에서 호출 — Streamlit 위젯 직접 갱신 대신 상태만 저장.
-        # progress 갱신은 poll 루프에서.
 
     results_holder: dict[str, list[dict]] = {}
     err_holder: dict[str, BaseException] = {}
@@ -104,35 +109,332 @@ def run_sync(bl_list: list[str], headless: bool, concurrency: int) -> list[dict]
 
 
 def _delta_str(prev_eta: str, curr_eta: str) -> str:
-    if not prev_eta or not curr_eta:
+    """D±n (차이) / '변동없음' (동일) / '신규' (prev 없고 curr 있음) / '' (그 외)."""
+    if not curr_eta:
         return ""
+    if not prev_eta:
+        return "신규"
     try:
         p = datetime.strptime(prev_eta, "%Y-%m-%d").date()
         c = datetime.strptime(curr_eta, "%Y-%m-%d").date()
     except ValueError:
         return ""
     d = (c - p).days
-    return f"D{d:+d}" if d else "D0"
+    return f"D{d:+d}" if d else "변동없음"
 
 
-def _row_style(row: pd.Series) -> list[str]:
-    """plan.md 7.2: CHANGED 빨강 / NEW 파랑 / UNCHANGED 회색."""
-    color_map = {
-        "CHANGED": "background-color: #ffe5e5; color: #a40000; font-weight: 600",
-        "NEW": "background-color: #e5f0ff; color: #1a4b8c",
-        "UNCHANGED": "color: #888",
-    }
-    return [color_map.get(row["change"], "")] * len(row)
+_REFRESH_STATUS_MAP = {"ok": "✓ 완료", "not_found": "✗ 없음", "failed": "✗ 실패"}
 
 
-# ─── 실행 ────────────────────────────────────────────────────────────────
-if run_clicked:
+def run_master_refresh_inplace(slot, bl_list: list[str], headless: bool, concurrency: int) -> list[dict]:
+    """새로고침 중 `slot`(데이터 에디터 자리)을 행별 진행 테이블로 교체하고,
+    호출 위치(보통 버튼 아래)에 프로그레스 바와 `x/y 조회 중…` 캡션을 렌더.
+    """
+    base = build_master_df().drop(columns=[SELECT_HEADER]).copy()
+    base.insert(0, "진행", "진행중")
+    slot.dataframe(base, use_container_width=True, hide_index=True)
+
+    progress_bar = st.progress(0.0)
+    status_slot = st.empty()
+    total = len(bl_list)
+    state: dict = {"done": 0, "per_bl": {}}
+
+    def on_progress(done: int, total_: int, bl: str, rec: dict) -> None:
+        state["done"] = done
+        state["per_bl"][bl] = _REFRESH_STATUS_MAP.get(rec.get("status", ""), "✓ 완료")
+
+    results_holder: dict[str, list[dict]] = {}
+    err_holder: dict[str, BaseException] = {}
+
+    def runner() -> None:
+        try:
+            results_holder["r"] = asyncio.run(
+                tracker.track_many(
+                    bl_list,
+                    headless=headless,
+                    concurrency=concurrency,
+                    on_progress=on_progress,
+                )
+            )
+        except BaseException as e:
+            err_holder["e"] = e
+
+    def redraw() -> None:
+        for bl, status in state["per_bl"].items():
+            base.loc[base["BL"] == bl, "진행"] = status
+        slot.dataframe(base, use_container_width=True, hide_index=True)
+        done = state["done"]
+        progress_bar.progress(done / total if total else 1.0)
+        status_slot.text(f"{done}/{total} 조회 중…")
+
+    th = threading.Thread(target=runner, daemon=True)
+    th.start()
+    while th.is_alive():
+        redraw()
+        th.join(timeout=0.4)
+    redraw()
+    progress_bar.progress(1.0)
+    status_slot.text(f"{state['done']}/{total} 완료")
+
+    if "e" in err_holder:
+        raise err_holder["e"]
+    return results_holder.get("r", [])
+
+
+def parse_bls(text: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in text.splitlines():
+        bl = line.strip()
+        if bl and bl not in seen:
+            seen.add(bl)
+            out.append(bl)
+    return out
+
+
+# ─── 마스터 테이블 렌더 파이프라인 ────────────────────────────────────────
+KO_HEADERS = [ko for _, ko in export.SHIPMENT_COLS]
+DB_FIELDS = [db_ for db_, _ in export.SHIPMENT_COLS]
+DERIVED_HEADERS = export.SHIPMENT_DERIVED_KO
+SELECT_HEADER = "선택"
+CARGO_HEADER = "화물 위치"
+DISPLAY_HEADERS = [SELECT_HEADER] + KO_HEADERS + DERIVED_HEADERS + [CARGO_HEADER]
+
+
+def _parse_date(s) -> date | None:
+    """여러 포맷의 날짜 문자열을 date로 파싱. 실패 시 None."""
+    if s is None:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    for fmt in ("%Y-%m-%d", "%Y.%m.%d", "%Y/%m/%d", "%Y%m%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def build_master_df() -> pd.DataFrame:
+    """shipments + eta_history 파생 컬럼(국내 도착일·전일 대비 변동) 합친 DF."""
+    rows = db.shipments_all()
+    out_rows: list[dict] = []
+    for r in rows:
+        latest = db.get_latest_for_bl(r["bl_no"])
+        prev = db.get_previous(r["bl_no"])
+        curr_eta = (latest or {}).get("eta") or ""
+        prev_eta = (prev or {}).get("eta") or ""
+        display: dict = {SELECT_HEADER: False}
+        for db_, ko in export.SHIPMENT_COLS:
+            v = r.get(db_)
+            if db_ == "initial_depart_date":
+                d = _parse_date(v)
+                v = d.strftime("%Y-%m-%d") if d else ""
+            elif db_ == "supply_tons":
+                v = float(v) if v is not None else float("nan")
+            else:
+                v = v if v is not None else ""
+            display[ko] = v
+        display["국내 도착일"] = curr_eta
+        display["전일 대비 변동"] = _delta_str(prev_eta, curr_eta)
+        display[CARGO_HEADER] = r.get("cargo_location") or ""
+        out_rows.append(display)
+    if not out_rows:
+        return pd.DataFrame(columns=DISPLAY_HEADERS)
+    df = pd.DataFrame(out_rows)[DISPLAY_HEADERS]
+    # 공급물량: 명시적 float64로 캐스팅해야 NumberColumn이 NaN을 빈칸으로 렌더
+    df["공급물량(톤)"] = pd.to_numeric(df["공급물량(톤)"], errors="coerce")
+    return df
+
+
+def _date_to_iso(v) -> str | None:
+    """date/Timestamp/str → 'YYYY-MM-DD'. 빈값/파싱실패 → None."""
+    if v is None:
+        return None
+    if hasattr(v, "strftime"):  # datetime/date/Timestamp
+        try:
+            if pd.isna(v):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return v.strftime("%Y-%m-%d")
+    d = _parse_date(v)
+    return d.strftime("%Y-%m-%d") if d else None
+
+
+def edited_to_records(edited: pd.DataFrame) -> list[dict]:
+    """data_editor 결과(한글 컬럼) → DB 컬럼 키 dict 리스트. 파생 컬럼은 버림."""
+    ko_to_db = {ko: db_ for db_, ko in export.SHIPMENT_COLS}
+    records: list[dict] = []
+    for _, row in edited.iterrows():
+        rec = {db_: row.get(ko) for ko, db_ in ko_to_db.items()}
+        rec["initial_depart_date"] = _date_to_iso(rec.get("initial_depart_date"))
+        if CARGO_HEADER in edited.columns:
+            rec["cargo_location"] = row.get(CARGO_HEADER)
+        records.append(rec)
+    return records
+
+
+# ─── 1. 선적 마스터 ──────────────────────────────────────────────────────
+master_df = build_master_df()
+
+# 헤더: 제목 + 우측 상단 아이콘(행 추가 / 선택 행 삭제 / 업로드 / 다운로드)
+hdr_cols = st.columns([10, 1, 1, 1, 1])
+with hdr_cols[0]:
+    st.subheader("1. 선적 마스터")
+with hdr_cols[1]:
+    add_clicked = st.button(
+        ":material/add:",
+        help="빈 행 추가",
+        use_container_width=True,
+    )
+with hdr_cols[2]:
+    delete_clicked = st.button(
+        ":material/remove:",
+        help="선택된 행 삭제",
+        use_container_width=True,
+    )
+with hdr_cols[3]:
+    with st.popover(":material/upload:", help="엑셀 업로드", use_container_width=True):
+        upload = st.file_uploader("xlsx 파일 선택", type=["xlsx"], label_visibility="collapsed")
+        if upload is not None:
+            fp_key = f"_uploaded_{upload.name}_{upload.size}"
+            if not st.session_state.get(fp_key):
+                try:
+                    recs = export.shipments_from_xlsx(upload.getvalue())
+                    db.shipments_replace(recs)
+                    st.session_state[fp_key] = True
+                    st.success(f"{len(recs)}건 업로드 완료")
+                    st.rerun()
+                except sqlite3.IntegrityError as e:
+                    st.error(f"업로드 실패 (BL 중복 등): {e}")
+                except Exception as e:
+                    st.error(f"업로드 실패: {type(e).__name__}: {e}")
+with hdr_cols[4]:
+    st.download_button(
+        ":material/download:",
+        data=export.shipments_to_xlsx(master_df.drop(columns=[SELECT_HEADER])),
+        file_name=f"shipments_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        help="엑셀 다운로드 (저장된 마스터 기준)",
+        use_container_width=True,
+    )
+
+master_slot = st.empty()
+edited = master_slot.data_editor(
+    master_df,
+    num_rows="fixed",
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        SELECT_HEADER: st.column_config.CheckboxColumn(
+            width=10,
+            help="삭제할 행 선택 후 우측 상단 ➖ 클릭",
+            default=False,
+        ),
+        "공급물량(톤)": st.column_config.NumberColumn(),
+        "최초출항일": st.column_config.TextColumn(
+            help="YYYY-MM-DD · 2026-04-20 / 2026.04.20 / 20260420 모두 가능 (저장 시 자동 YYYY-MM-DD)",
+        ),
+        "국내 도착일": st.column_config.TextColumn(
+            disabled=True,
+            help="track-trace 조회 결과 (YYYY-MM-DD)",
+        ),
+        "전일 대비 변동": st.column_config.TextColumn(disabled=True, help="D±n / 변동없음 (오늘 이전 최신 ETA 대비)"),
+        CARGO_HEADER: st.column_config.TextColumn(help="화물 위치 (자동 조회는 추후 연동)"),
+    },
+    key="shipments_editor",
+)
+
+if add_clicked:
+    # 현재 편집 상태 저장 + 빈 행 1개 추가
+    current = edited_to_records(pd.DataFrame(edited))
+    current.append({k: None for k in ("smelter","origin","carrier","vessel","bl_no","supply_tons","initial_depart_date")})
+    try:
+        db.shipments_replace(current)
+        st.rerun()
+    except sqlite3.IntegrityError as e:
+        st.error(f"행 추가 실패 (BL 중복): {e}")
+
+if delete_clicked:
+    df_edit = pd.DataFrame(edited)
+    if SELECT_HEADER in df_edit.columns:
+        mask = df_edit[SELECT_HEADER].fillna(False).astype(bool)
+        if not mask.any():
+            st.warning("삭제할 행을 먼저 체크박스로 선택하세요.")
+        else:
+            remaining = df_edit[~mask]
+            try:
+                db.shipments_replace(edited_to_records(remaining))
+                st.success(f"{int(mask.sum())}건 삭제 완료")
+                st.rerun()
+            except sqlite3.IntegrityError as e:
+                st.error(f"삭제 실패 (BL 중복): {e}")
+
+btn_cols = st.columns(2)
+
+with btn_cols[0]:
+    if st.button("테이블 저장", use_container_width=True):
+        try:
+            db.shipments_replace(edited_to_records(pd.DataFrame(edited)))
+            st.success("저장 완료")
+            st.rerun()
+        except sqlite3.IntegrityError as e:
+            st.error(f"저장 실패 (BL 중복): {e}")
+
+with btn_cols[1]:
+    refresh_clicked = st.button("ETA/위치 새로고침", type="primary", use_container_width=True)
+
+if refresh_clicked:
+    # 저장 선행
+    try:
+        db.shipments_replace(edited_to_records(pd.DataFrame(edited)))
+    except sqlite3.IntegrityError as e:
+        st.error(f"저장 실패 (BL 중복): {e}")
+        st.stop()
+
+    bls = [r["bl_no"] for r in db.shipments_all() if r.get("bl_no")]
+    if not bls:
+        st.warning("마스터에 BL이 없습니다.")
+    else:
+        try:
+            results = run_master_refresh_inplace(
+                master_slot, bls, headless=not headed, concurrency=concurrency
+            )
+        except Exception as e:
+            st.error(f"조회 실패: {type(e).__name__}: {e}")
+            st.stop()
+        for r in results:
+            db.save_record(r)
+        ok = sum(1 for r in results if r["status"] == "ok")
+        nf = sum(1 for r in results if r["status"] == "not_found")
+        failed = sum(1 for r in results if r["status"] == "failed")
+        st.session_state["_refresh_done"] = {
+            "n": len(results), "ok": ok, "nf": nf, "failed": failed,
+        }
+        st.rerun()
+
+
+# ─── 2. 빠른 조회 ────────────────────────────────────────────────────────
+st.divider()
+st.subheader("2. 빠른 조회")
+st.caption("마스터에 없는 BL을 일회성으로 조회 (DB엔 eta_history로 저장, 마스터 미영향)")
+
+raw = st.text_area(
+    "BL 번호를 줄바꿈으로 구분해 붙여넣기",
+    height=150,
+    placeholder="MAEU266930123\nHDMUDOHA62608100\n...",
+)
+quick_clicked = st.button("조회 시작", disabled=not raw.strip())
+
+
+if quick_clicked:
     bl_list = parse_bls(raw)
     if not bl_list:
         st.warning("유효한 BL이 없습니다.")
         st.stop()
 
-    st.subheader("2. 진행률")
     t0 = datetime.now()
     try:
         results = run_sync(bl_list, headless=not headed, concurrency=concurrency)
@@ -141,65 +443,47 @@ if run_clicked:
         st.stop()
     elapsed = (datetime.now() - t0).total_seconds()
 
-    # ─── 변동 분류 + DB 저장 ──────────────────────────────────────────
-    # 순서: prev 조회(이전 스냅샷) → compare → save(현재 조회 레코드 기록)
     rows: list[dict] = []
     for r in results:
         prev = db.get_previous(r["bl_no"])
-        change = db.compare(prev, r)
         prev_eta = (prev.get("eta") if prev else "") or ""
         curr_eta = r.get("eta") or ""
         rows.append({
-            "change": change,
-            "변동일수": _delta_str(prev_eta, curr_eta) if change == "CHANGED" else "",
             "BL": r["bl_no"],
             "선사": r.get("carrier") or "",
             "항구": r.get("port") or "",
             "이전 ETA": prev_eta,
             "ETA": curr_eta,
+            "전일 대비 변동": _delta_str(prev_eta, curr_eta),
             "status": r["status"],
         })
         db.save_record(r)
 
-    # 다운로드 버튼 클릭 시 Streamlit rerun이 발생해도 결과가 사라지지 않도록 session_state에 캐시
-    st.session_state["last_run"] = {
+    st.session_state["quick_run"] = {
         "rows": rows,
         "results": results,
         "elapsed": elapsed,
     }
 
 
-# ─── 결과 렌더링 (session_state 기반) ──────────────────────────────────
-last = st.session_state.get("last_run")
+last = st.session_state.get("quick_run")
 if last:
     rows = last["rows"]
     results = last["results"]
     elapsed = last["elapsed"]
 
-    st.subheader("3. 결과")
     ok = sum(1 for r in results if r["status"] == "ok")
     nf = sum(1 for r in results if r["status"] == "not_found")
     failed = sum(1 for r in results if r["status"] == "failed")
-    changed = sum(1 for row in rows if row["change"] == "CHANGED")
-    new_cnt = sum(1 for row in rows if row["change"] == "NEW")
     st.write(
-        f"**{len(results)}건** · ok {ok} · not_found {nf} · failed {failed} · "
-        f"CHANGED {changed} · NEW {new_cnt} · 소요 {elapsed:.1f}s"
+        f"**{len(results)}건** · ok {ok} · not_found {nf} · failed {failed} · 소요 {elapsed:.1f}s"
     )
     if failed:
-        st.warning(f"{failed}건 조회 실패 — 테이블 하단 status=failed 행 확인")
+        st.warning(f"{failed}건 조회 실패 — status=failed 행 확인")
 
     df = pd.DataFrame(rows)
-    # CHANGED 상단 정렬 (CHANGED → NEW → UNCHANGED)
-    order = {"CHANGED": 0, "NEW": 1, "UNCHANGED": 2}
-    df = df.sort_values(
-        by="change", key=lambda s: s.map(order).fillna(3), kind="stable"
-    ).reset_index(drop=True)
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-    styled = df.style.apply(_row_style, axis=1)
-    st.dataframe(styled, use_container_width=True, hide_index=True)
-
-    # ─── Export ────────────────────────────────────────────────────────
     today = date.today().isoformat()
     col_csv, col_xlsx, _ = st.columns([1, 1, 6])
     col_csv.download_button(

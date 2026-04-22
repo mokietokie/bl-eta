@@ -75,7 +75,11 @@ uv run python -m bl_eta.tracker <BL_NO> [--headed] [--dump DIR]
 → `docs/carrier-samples.md`에 해당 선사 HTML 패턴을 기록하고 `bl_eta/parser.py`에서 라벨 whitelist/blacklist 조정. `--dump DIR`로 raw HTML 덤프.
 
 **DB 초기화하고 싶음**
-→ 사이드바 `DB 초기화` 버튼 (되돌릴 수 없음). 파일 직접 삭제는 `bl_eta.db`.
+→ 사이드바 `DB 초기화` 버튼 (되돌릴 수 없음). 파일 직접 삭제:
+- macOS/Linux: `~/.bl-eta/bl_eta.db`
+- Windows: `%USERPROFILE%\.bl-eta\bl_eta.db`
+
+DB는 각 사용자 홈 디렉토리에만 생성되며, 사용자 간 공유되지 않습니다. 기존에 프로젝트 루트에 있던 `bl_eta.db`는 최초 실행 시 자동 이관됩니다.
 
 ---
 
