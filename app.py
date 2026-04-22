@@ -14,9 +14,14 @@ from bl_eta import db, export, tracker
 
 db.init_db()
 
-st.set_page_config(page_title="bl-eta", layout="wide")
-st.title("bl-eta")
-st.caption("track-trace.com 병렬 BL 조회 — 부산/인천 ETA + 전일 대비 변동 감지")
+st.set_page_config(page_title="bl-eta", layout="wide", initial_sidebar_state="collapsed")
+
+_title_cols = st.columns([10, 1])
+with _title_cols[0]:
+    st.title("선박 ETA 자동화 시스템")
+    st.caption("track-trace.com 병렬 BL 조회 — 부산/인천 ETA + 전일 대비 변동 감지")
+with _title_cols[1]:
+    _settings_popover = st.popover(":material/settings:", help="설정", use_container_width=True)
 
 
 # ─── 새로고침 완료 모달 ─────────────────────────────────────────────────
@@ -36,8 +41,8 @@ if "_refresh_done" in st.session_state:
     _done_dialog()
 
 
-# ─── 사이드바 ────────────────────────────────────────────────────────────
-with st.sidebar:
+# ─── 설정 (우상단 톱니바퀴 popover) ──────────────────────────────────────
+with _settings_popover:
     st.header("설정")
     headed = st.toggle(
         "Headed 모드 (브라우저 창 표시)",
@@ -276,13 +281,106 @@ def edited_to_records(edited: pd.DataFrame) -> list[dict]:
     return records
 
 
-# ─── 1. 선적 마스터 ──────────────────────────────────────────────────────
+# ─── 1. 빠른 조회 ────────────────────────────────────────────────────────
+st.subheader("1. BL 조회")
+
+_prev_raw = st.session_state.get("quick_raw", "")
+_lines = max(1, _prev_raw.count("\n") + 1)
+_h = max(68, min(600, 38 + 24 * _lines))
+raw = st.text_area(
+    "BL 번호 입력",
+    height=_h,
+    placeholder="BL 번호 입력 (여러 건은 줄바꿈)",
+    key="quick_raw",
+    label_visibility="collapsed",
+)
+quick_clicked = st.button("조회 시작", disabled=not raw.strip())
+
+
+if quick_clicked:
+    bl_list = parse_bls(raw)
+    if not bl_list:
+        st.warning("유효한 BL이 없습니다.")
+        st.stop()
+
+    t0 = datetime.now()
+    try:
+        results = run_sync(bl_list, headless=not headed, concurrency=concurrency)
+    except Exception as e:
+        st.error(f"조회 실패: {type(e).__name__}: {e}")
+        st.stop()
+    elapsed = (datetime.now() - t0).total_seconds()
+
+    rows: list[dict] = []
+    for r in results:
+        prev = db.get_previous(r["bl_no"])
+        prev_eta = (prev.get("eta") if prev else "") or ""
+        curr_eta = r.get("eta") or ""
+        rows.append({
+            "BL": r["bl_no"],
+            "선사": r.get("carrier") or "",
+            "항구": r.get("port") or "",
+            "이전 ETA": prev_eta,
+            "ETA": curr_eta,
+            "전일 대비 변동": _delta_str(prev_eta, curr_eta),
+            "status": r["status"],
+        })
+        db.save_record(r)
+
+    st.session_state["quick_run"] = {
+        "rows": rows,
+        "results": results,
+        "elapsed": elapsed,
+    }
+
+
+last = st.session_state.get("quick_run")
+if last:
+    rows = last["rows"]
+    results = last["results"]
+    elapsed = last["elapsed"]
+
+    ok = sum(1 for r in results if r["status"] == "ok")
+    nf = sum(1 for r in results if r["status"] == "not_found")
+    failed = sum(1 for r in results if r["status"] == "failed")
+    st.write(
+        f"**{len(results)}건** · ok {ok} · not_found {nf} · failed {failed} · 소요 {elapsed:.1f}s"
+    )
+    if failed:
+        st.warning(f"{failed}건 조회 실패 — status=failed 행 확인")
+
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    today = date.today().isoformat()
+    col_csv, col_xlsx, _ = st.columns([1, 1, 6])
+    col_csv.download_button(
+        "CSV 다운로드",
+        data=export.to_csv(df),
+        file_name=f"bl_eta_{today}.csv",
+        mime="text/csv",
+    )
+    col_xlsx.download_button(
+        "엑셀 다운로드",
+        data=export.to_xlsx(df),
+        file_name=f"bl_eta_{today}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    with st.expander("raw_text (디버깅용)"):
+        for r in results:
+            st.markdown(f"**{r['bl_no']}** · `{r['status']}`")
+            st.code((r.get("raw_text") or "")[:1500], language="text")
+
+
+# ─── 2. 선적 마스터 ──────────────────────────────────────────────────────
+st.divider()
 master_df = build_master_df()
 
 # 헤더: 제목 + 우측 상단 아이콘(행 추가 / 선택 행 삭제 / 업로드 / 다운로드)
 hdr_cols = st.columns([10, 1, 1, 1, 1])
 with hdr_cols[0]:
-    st.subheader("1. 선적 마스터")
+    st.subheader("2. 선박 자동화 관리양식")
 with hdr_cols[1]:
     add_clicked = st.button(
         ":material/add:",
@@ -416,90 +514,3 @@ if refresh_clicked:
         st.rerun()
 
 
-# ─── 2. 빠른 조회 ────────────────────────────────────────────────────────
-st.divider()
-st.subheader("2. 빠른 조회")
-st.caption("마스터에 없는 BL을 일회성으로 조회 (DB엔 eta_history로 저장, 마스터 미영향)")
-
-raw = st.text_area(
-    "BL 번호를 줄바꿈으로 구분해 붙여넣기",
-    height=150,
-    placeholder="MAEU266930123\nHDMUDOHA62608100\n...",
-)
-quick_clicked = st.button("조회 시작", disabled=not raw.strip())
-
-
-if quick_clicked:
-    bl_list = parse_bls(raw)
-    if not bl_list:
-        st.warning("유효한 BL이 없습니다.")
-        st.stop()
-
-    t0 = datetime.now()
-    try:
-        results = run_sync(bl_list, headless=not headed, concurrency=concurrency)
-    except Exception as e:
-        st.error(f"조회 실패: {type(e).__name__}: {e}")
-        st.stop()
-    elapsed = (datetime.now() - t0).total_seconds()
-
-    rows: list[dict] = []
-    for r in results:
-        prev = db.get_previous(r["bl_no"])
-        prev_eta = (prev.get("eta") if prev else "") or ""
-        curr_eta = r.get("eta") or ""
-        rows.append({
-            "BL": r["bl_no"],
-            "선사": r.get("carrier") or "",
-            "항구": r.get("port") or "",
-            "이전 ETA": prev_eta,
-            "ETA": curr_eta,
-            "전일 대비 변동": _delta_str(prev_eta, curr_eta),
-            "status": r["status"],
-        })
-        db.save_record(r)
-
-    st.session_state["quick_run"] = {
-        "rows": rows,
-        "results": results,
-        "elapsed": elapsed,
-    }
-
-
-last = st.session_state.get("quick_run")
-if last:
-    rows = last["rows"]
-    results = last["results"]
-    elapsed = last["elapsed"]
-
-    ok = sum(1 for r in results if r["status"] == "ok")
-    nf = sum(1 for r in results if r["status"] == "not_found")
-    failed = sum(1 for r in results if r["status"] == "failed")
-    st.write(
-        f"**{len(results)}건** · ok {ok} · not_found {nf} · failed {failed} · 소요 {elapsed:.1f}s"
-    )
-    if failed:
-        st.warning(f"{failed}건 조회 실패 — status=failed 행 확인")
-
-    df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    today = date.today().isoformat()
-    col_csv, col_xlsx, _ = st.columns([1, 1, 6])
-    col_csv.download_button(
-        "CSV 다운로드",
-        data=export.to_csv(df),
-        file_name=f"bl_eta_{today}.csv",
-        mime="text/csv",
-    )
-    col_xlsx.download_button(
-        "엑셀 다운로드",
-        data=export.to_xlsx(df),
-        file_name=f"bl_eta_{today}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-    with st.expander("raw_text (디버깅용)"):
-        for r in results:
-            st.markdown(f"**{r['bl_no']}** · `{r['status']}`")
-            st.code((r.get("raw_text") or "")[:1500], language="text")
