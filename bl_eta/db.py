@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS shipments (
     smelter             TEXT,
     origin              TEXT,
     carrier             TEXT,
+    imo                 TEXT,
     vessel              TEXT,
     bl_no               TEXT UNIQUE,
     supply_tons         REAL,
@@ -78,6 +79,7 @@ def init_db(db_path: Path | None = None) -> None:
             conn.executescript(_SCHEMA)
             _migrate_shipments_bl_nullable(conn)
             _migrate_shipments_add_cargo_location(conn)
+            _migrate_shipments_add_imo(conn)
             conn.commit()
         finally:
             conn.close()
@@ -90,6 +92,14 @@ def _migrate_shipments_add_cargo_location(conn: sqlite3.Connection) -> None:
     if any(c["name"] == "cargo_location" for c in cols):
         return
     conn.execute("ALTER TABLE shipments ADD COLUMN cargo_location TEXT")
+
+
+def _migrate_shipments_add_imo(conn: sqlite3.Connection) -> None:
+    """shipments.imo 컬럼이 없으면 추가 (idempotent). VesselFinder IMO 7자리 숫자 문자열."""
+    cols = conn.execute("PRAGMA table_info(shipments)").fetchall()
+    if any(c["name"] == "imo" for c in cols):
+        return
+    conn.execute("ALTER TABLE shipments ADD COLUMN imo TEXT")
 
 
 def _migrate_shipments_bl_nullable(conn: sqlite3.Connection) -> None:
@@ -196,7 +206,7 @@ def get_latest_for_bl(bl_no: str, db_path: Path | None = None) -> dict[str, Any]
 # ─── shipments (마스터) ────────────────────────────────────────────────
 
 _SHIPMENT_FIELDS = (
-    "smelter", "origin", "carrier", "vessel",
+    "smelter", "origin", "carrier", "imo", "vessel",
     "bl_no", "supply_tons", "initial_depart_date",
 )
 
@@ -208,7 +218,7 @@ def shipments_all(db_path: Path | None = None) -> list[dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT id, smelter, origin, carrier, vessel, bl_no,
+            SELECT id, smelter, origin, carrier, imo, vessel, bl_no,
                    supply_tons, initial_depart_date, cargo_location
             FROM shipments
             ORDER BY id ASC
@@ -236,6 +246,7 @@ def shipments_replace(rows: list[dict[str, Any]], db_path: Path | None = None) -
             smelter = _clean_str(r.get("smelter"))
             origin = _clean_str(r.get("origin"))
             carrier = _clean_str(r.get("carrier"))
+            imo = _clean_imo(r.get("imo"))
             vessel = _clean_str(r.get("vessel"))
             idd = _clean_str(r.get("initial_depart_date"))
             cargo_loc = _clean_str(r.get("cargo_location"))
@@ -243,10 +254,10 @@ def shipments_replace(rows: list[dict[str, Any]], db_path: Path | None = None) -
             conn.execute(
                 """
                 INSERT INTO shipments
-                  (smelter, origin, carrier, vessel, bl_no, supply_tons, initial_depart_date, cargo_location)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  (smelter, origin, carrier, imo, vessel, bl_no, supply_tons, initial_depart_date, cargo_location)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (smelter, origin, carrier, vessel, bl, tons, idd, cargo_loc),
+                (smelter, origin, carrier, imo, vessel, bl, tons, idd, cargo_loc),
             )
         conn.commit()
     except Exception:
@@ -264,6 +275,18 @@ def _clean_str(v: Any) -> str | None:
     return s or None
 
 
+def _clean_imo(v: Any) -> str | None:
+    """IMO 정규화: float(엑셀 숫자) → 정수 문자열, trim. 형식 검증은 vesselfinder 측 IMO_RE에 위임 — 잘못된 값도 DB에 보존해 사용자가 화면에서 수정할 수 있게 한다."""
+    if v is None or v != v:
+        return None
+    if isinstance(v, float):
+        if v != v:
+            return None
+        v = str(int(v)) if v.is_integer() else str(v)
+    s = str(v).strip()
+    return s or None
+
+
 def _to_float(v: Any) -> float | None:
     if v is None or v == "":
         return None
@@ -273,31 +296,65 @@ def _to_float(v: Any) -> float | None:
         return None
 
 
-def update_cargo_locations(
-    mapping: dict[str, str], db_path: Path | None = None
+def update_vessel_imo(
+    vessel: str, imo: str, db_path: Path | None = None
 ) -> int:
-    """vessel 이름 → cargo_location 일괄 업데이트. 업데이트된 행 수 반환.
+    """같은 vessel을 가진 행 중 imo가 비어있는 행에만 imo 백필.
 
-    동일 vessel로 여러 shipment 행이 있으면 모두 같은 값으로 갱신된다.
+    이미 IMO가 채워져 있는 행(다른 IMO 포함)은 사용자 입력을 존중해 건드리지 않는다.
     """
-    if not mapping:
+    if not vessel or not imo:
         return 0
     _ensure_init()
     conn = _connect(db_path)
-    total = 0
     try:
-        for vessel, loc in mapping.items():
-            if not vessel:
-                continue
-            cur = conn.execute(
-                "UPDATE shipments SET cargo_location = ? WHERE vessel = ?",
-                (loc, vessel),
-            )
-            total += cur.rowcount or 0
+        cur = conn.execute(
+            "UPDATE shipments SET imo = ? WHERE vessel = ? AND (imo IS NULL OR imo = '')",
+            (imo, vessel),
+        )
         conn.commit()
     finally:
         conn.close()
-    return total
+    return cur.rowcount or 0
+
+
+def update_cargo_location_by_imo(
+    imo: str, label: str, db_path: Path | None = None
+) -> int:
+    """imo 매칭 행의 cargo_location 일괄 UPDATE. 동일 IMO 다중 행 모두 갱신."""
+    if not imo:
+        return 0
+    _ensure_init()
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE shipments SET cargo_location = ? WHERE imo = ?",
+            (label, imo),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return cur.rowcount or 0
+
+
+def update_cargo_location_by_vessel(
+    vessel: str, label: str, db_path: Path | None = None
+) -> int:
+    """vessel 매칭 행의 cargo_location 일괄 UPDATE. IMO 우선 정책 보존을 위해
+    imo가 NULL/빈 행만 대상으로 한다."""
+    if not vessel:
+        return 0
+    _ensure_init()
+    conn = _connect(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE shipments SET cargo_location = ? WHERE vessel = ? AND (imo IS NULL OR imo = '')",
+            (label, vessel),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return cur.rowcount or 0
 
 
 def get_recent(limit: int = 100, db_path: Path | None = None) -> list[dict[str, Any]]:

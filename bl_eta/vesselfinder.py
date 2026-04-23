@@ -1,12 +1,15 @@
-"""VesselFinder 선명 → 현재 위치(가장 가까운 연안 국가) 추출.
+"""VesselFinder 선명/IMO → 현재 위치(가장 가까운 연안 국가) 추출.
 
-흐름:
-  선명으로 vesselfinder.com 검색 →
-  Container Ship 첫 결과 상세페이지 진입 →
-  Track on Map 클릭 → 지도 페이지 HTML의 meta description에서 lat/lon 파싱 →
-  reverse_geocoder(오프라인)로 가장 가까운 도시/국가 → 한국어 국가명.
+두 경로:
+  1) IMO 직접 조회 (권장): `/?imo=<IMO>` 지도 페이지 직행 → meta description 파싱.
+  2) 선명 검색 폴백: `vessels?name=...` → Container Ship 첫 결과 상세 → Track on Map →
+     지도 페이지. 이름 검색이 성공하면 detail_url에서 IMO를 추출해 결과 dict에 채운다.
 
-CLI: `uv run python -m bl_eta.vesselfinder "MONACO MAERSK"`
+좌표 → reverse_geocoder(오프라인) → ISO2 → `_CC_KO` 한국어 국가명.
+
+CLI:
+  `uv run python -m bl_eta.vesselfinder "MONACO MAERSK"`  (이름 검색)
+  `uv run python -m bl_eta.vesselfinder --imo 9778832`     (IMO 직접)
 """
 
 from __future__ import annotations
@@ -14,11 +17,27 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote_plus
 
 import reverse_geocoder as _rg
+
+_RG_LOCK = threading.Lock()
+
+
+def _warmup_rg() -> None:
+    # reverse_geocoder는 모듈 싱글톤을 lazy init하며 스레드-세이프하지 않다.
+    # 병렬 워커가 초기화 중인 내부 구조를 동시에 순회하면
+    # "dictionary changed size during iteration"이 발생하므로 import 시점에 강제 초기화.
+    try:
+        _rg.search([(0.0, 0.0)], mode=1)
+    except Exception:
+        pass
+
+
+_warmup_rg()
 from playwright.async_api import (
     Browser,
     BrowserContext,
@@ -30,8 +49,10 @@ from playwright.async_api import (
 from bl_eta.tracker import RENDER_TIMEOUT_MS, _new_context
 
 SEARCH_URL = "https://www.vesselfinder.com/vessels?name={name}"
-DETAIL_URL_RE = re.compile(r"/vessels/details/\d+", re.IGNORECASE)
+IMO_MAP_URL = "https://www.vesselfinder.com/?imo={imo}"
+DETAIL_URL_RE = re.compile(r"/vessels/details/(\d+)", re.IGNORECASE)
 TRACK_ON_MAP_RE = re.compile(r"track\s+on\s+map", re.IGNORECASE)
+IMO_RE = re.compile(r"^\d{7}$")
 DUMP_DIR = Path.home() / ".bl-eta"
 
 # 지도 페이지 HTML meta description 예:
@@ -111,7 +132,8 @@ def _parse_latlon_from_html(html: str) -> tuple[float, float] | None:
 
 def _nearest_country_ko(lat: float, lon: float) -> tuple[str, str, str]:
     """좌표 → (한국어 국가명, ISO2, 가장 가까운 도시명). 오프라인 reverse_geocoder."""
-    hits = _rg.search([(lat, lon)], mode=1)
+    with _RG_LOCK:
+        hits = _rg.search([(lat, lon)], mode=1)
     if not hits:
         return "알 수 없음", "", ""
     rec = hits[0]
@@ -134,7 +156,7 @@ async def _click_first_container_ship(page: Page) -> None:
         .first
     )
     try:
-        await row.wait_for(state="visible", timeout=10_000)
+        await row.wait_for(state="visible", timeout=20_000)
     except PlaywrightTimeoutError:
         DUMP_DIR.mkdir(parents=True, exist_ok=True)
         (DUMP_DIR / "vf-search-dump.html").write_text(
@@ -161,8 +183,8 @@ async def _click_track_on_map(page: Page) -> None:
     for build in candidates:
         try:
             loc = build()
-            await loc.wait_for(state="visible", timeout=5_000)
-            await loc.click(timeout=3_000)
+            await loc.wait_for(state="visible", timeout=10_000)
+            await loc.click(timeout=6_000)
             return
         except Exception as e:
             last_err = e
@@ -170,11 +192,69 @@ async def _click_track_on_map(page: Page) -> None:
     raise RuntimeError(f"'Track on Map' 버튼을 찾지 못했습니다 ({last_err})")
 
 
-async def _lookup_one(context: BrowserContext, vessel_name: str) -> dict[str, Any]:
-    """단일 선명 → 위치 정보 dict.
+def _empty_result(vessel: str, imo: str | None, status: str, **extra) -> dict[str, Any]:
+    rec = {
+        "vessel": vessel, "imo": imo, "status": status,
+        "lat": None, "lon": None,
+        "country_ko": None, "cc": None, "nearest_city": None,
+        "location_label": None, "detail_url": None, "map_url": None,
+    }
+    rec.update(extra)
+    return rec
 
-    status: 'ok' | 'not_found' | 'failed'
+
+async def _lookup_by_imo(
+    context: BrowserContext, imo: str, vessel_hint: str | None = None
+) -> dict[str, Any]:
+    """IMO 직접 조회 — `/?imo=<IMO>` 지도 페이지 1회 진입으로 끝낸다.
+
+    검색→상세→Track on Map 3단계 생략. 동명이선 RISK도 IMO로 해소.
     """
+    page = await context.new_page()
+    map_url = IMO_MAP_URL.format(imo=imo)
+    vessel = vessel_hint or ""
+    try:
+        await page.goto(map_url, wait_until="domcontentloaded", timeout=RENDER_TIMEOUT_MS)
+        try:
+            await page.wait_for_timeout(2_000)
+        except Exception:
+            pass
+        html = await page.content()
+        latlon = _parse_latlon_from_html(html)
+        if latlon is None:
+            DUMP_DIR.mkdir(parents=True, exist_ok=True)
+            (DUMP_DIR / f"vf-map-dump-{imo}.html").write_text(html, encoding="utf-8")
+            return _empty_result(
+                vessel, imo, "failed",
+                map_url=map_url,
+                error="meta description 좌표 파싱 실패 (IMO 직접)",
+            )
+        lat, lon = latlon
+        country_ko, cc, city = _nearest_country_ko(lat, lon)
+        return _empty_result(
+            vessel, imo, "ok",
+            lat=lat, lon=lon,
+            country_ko=country_ko, cc=cc, nearest_city=city,
+            location_label=_format_label(country_ko, city),
+            map_url=map_url,
+        )
+    except Exception as e:
+        return _empty_result(
+            vessel, imo, "failed",
+            map_url=map_url,
+            error=f"{type(e).__name__}: {e}",
+        )
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
+
+async def _lookup_by_name(
+    context: BrowserContext, vessel_name: str
+) -> dict[str, Any]:
+    """선명 검색 폴백. 성공 시 detail_url의 IMO를 결과 dict에 채움 (백필 용도)."""
     page = await context.new_page()
     try:
         await page.goto(
@@ -185,19 +265,16 @@ async def _lookup_one(context: BrowserContext, vessel_name: str) -> dict[str, An
         try:
             await _click_first_container_ship(page)
         except RuntimeError:
-            return {
-                "vessel": vessel_name, "status": "not_found",
-                "lat": None, "lon": None,
-                "country_ko": None, "cc": None, "nearest_city": None,
-                "location_label": None, "detail_url": None, "map_url": None,
-            }
+            return _empty_result(vessel_name, None, "not_found")
         try:
-            await page.wait_for_url(DETAIL_URL_RE, timeout=15_000)
+            await page.wait_for_url(DETAIL_URL_RE, timeout=25_000)
         except PlaywrightTimeoutError:
             pass
         detail_url = page.url
-        if not DETAIL_URL_RE.search(detail_url):
+        m_imo = DETAIL_URL_RE.search(detail_url)
+        if not m_imo:
             raise RuntimeError(f"상세페이지 전환 실패: {detail_url}")
+        extracted_imo = m_imo.group(1)
 
         try:
             await page.wait_for_timeout(1_500)
@@ -218,32 +295,25 @@ async def _lookup_one(context: BrowserContext, vessel_name: str) -> dict[str, An
 
         latlon = _parse_latlon_from_html(html)
         if latlon is None:
-            return {
-                "vessel": vessel_name, "status": "failed",
-                "lat": None, "lon": None,
-                "country_ko": None, "cc": None, "nearest_city": None,
-                "location_label": None,
-                "detail_url": detail_url, "map_url": map_url,
-                "error": "meta description 좌표 파싱 실패",
-            }
+            return _empty_result(
+                vessel_name, extracted_imo, "failed",
+                detail_url=detail_url, map_url=map_url,
+                error="meta description 좌표 파싱 실패 (이름 검색)",
+            )
         lat, lon = latlon
         country_ko, cc, city = _nearest_country_ko(lat, lon)
-        return {
-            "vessel": vessel_name, "status": "ok",
-            "lat": lat, "lon": lon,
-            "country_ko": country_ko, "cc": cc, "nearest_city": city,
-            "location_label": _format_label(country_ko, city),
-            "detail_url": detail_url, "map_url": map_url,
-        }
+        return _empty_result(
+            vessel_name, extracted_imo, "ok",
+            lat=lat, lon=lon,
+            country_ko=country_ko, cc=cc, nearest_city=city,
+            location_label=_format_label(country_ko, city),
+            detail_url=detail_url, map_url=map_url,
+        )
     except Exception as e:
-        return {
-            "vessel": vessel_name, "status": "failed",
-            "lat": None, "lon": None,
-            "country_ko": None, "cc": None, "nearest_city": None,
-            "location_label": None,
-            "detail_url": None, "map_url": None,
-            "error": f"{type(e).__name__}: {e}",
-        }
+        return _empty_result(
+            vessel_name, None, "failed",
+            error=f"{type(e).__name__}: {e}",
+        )
     finally:
         try:
             await page.close()
@@ -251,21 +321,76 @@ async def _lookup_one(context: BrowserContext, vessel_name: str) -> dict[str, An
             pass
 
 
+async def _lookup_one(
+    context: BrowserContext, vessel_name: str, imo: str | None = None
+) -> dict[str, Any]:
+    """단일 항목 → 위치 정보 dict. IMO 7자리가 있으면 직접 조회, 아니면 이름 검색.
+
+    status: 'ok' | 'not_found' | 'failed'
+    """
+    imo_clean = (imo or "").strip()
+    if imo_clean and IMO_RE.fullmatch(imo_clean):
+        return await _lookup_by_imo(context, imo_clean, vessel_name)
+    return await _lookup_by_name(context, vessel_name)
+
+
+async def _lookup_with_retry(
+    context: BrowserContext,
+    vessel_name: str,
+    imo: str | None = None,
+    *,
+    attempts: int = 2,
+    backoff_s: float = 2.0,
+) -> dict[str, Any]:
+    """failed면 1회 재시도. not_found는 결과가 안 바뀌므로 재시도하지 않는다."""
+    last: dict[str, Any] | None = None
+    for i in range(attempts):
+        rec = await _lookup_one(context, vessel_name, imo)
+        st = rec.get("status")
+        if st == "ok":
+            if i > 0:
+                rec["retried"] = True
+            return rec
+        if st == "not_found":
+            return rec
+        last = rec
+        if i < attempts - 1:
+            await asyncio.sleep(backoff_s)
+    return last or _empty_result(vessel_name, imo, "failed", error="알 수 없는 실패")
+
+
 ProgressCb = Callable[[int, int, str, dict[str, Any]], None] | None
 
 
+def _normalize_items(items: list[dict[str, Any] | str]) -> list[dict[str, Any]]:
+    """str 또는 dict({"vessel","imo"}) 입력을 dict 리스트로 정규화."""
+    out: list[dict[str, Any]] = []
+    for it in items:
+        if isinstance(it, str):
+            out.append({"vessel": it, "imo": None})
+        else:
+            out.append({"vessel": it.get("vessel") or "", "imo": it.get("imo")})
+    return out
+
+
 async def track_many_locations(
-    vessels: list[str],
+    items: list[dict[str, Any] | str],
     *,
     headless: bool = True,
     concurrency: int = 5,
     on_progress: ProgressCb = None,
 ) -> list[dict[str, Any]]:
-    """다수 선명 병렬 위치 조회. 결과는 입력 순서 보존."""
-    if not vessels:
+    """다수 항목 병렬 위치 조회. 결과는 입력 순서 보존.
+
+    items 원소: `str` (선명) 또는 `{"vessel": str, "imo": str | None}` dict.
+    IMO가 7자리 숫자면 검색을 건너뛰고 지도 페이지로 직행한다.
+    각 항목에 1회 자동 재시도 (failed인 경우만, not_found는 즉시 반환).
+    """
+    norm = _normalize_items(items)
+    if not norm:
         return []
-    concurrency = max(1, min(concurrency, len(vessels)))
-    results: list[dict[str, Any] | None] = [None] * len(vessels)
+    concurrency = max(1, min(concurrency, len(norm)))
+    results: list[dict[str, Any] | None] = [None] * len(norm)
     completed = 0
     lock = asyncio.Lock()
 
@@ -276,12 +401,14 @@ async def track_many_locations(
         )
         sem = asyncio.Semaphore(concurrency)
 
-        async def worker(idx: int, v: str) -> None:
+        async def worker(idx: int, item: dict[str, Any]) -> None:
             nonlocal completed
+            vessel = item["vessel"]
+            imo = item.get("imo")
             async with sem:
                 ctx = await _new_context(browser)
                 try:
-                    rec = await _lookup_one(ctx, v)
+                    rec = await _lookup_with_retry(ctx, vessel, imo)
                 finally:
                     try:
                         await ctx.close()
@@ -293,42 +420,52 @@ async def track_many_locations(
                 done = completed
             if on_progress is not None:
                 try:
-                    on_progress(done, len(vessels), v, rec)
+                    on_progress(done, len(norm), vessel, rec)
                 except Exception:
                     pass
 
         try:
-            await asyncio.gather(*(worker(i, v) for i, v in enumerate(vessels)))
+            await asyncio.gather(*(worker(i, it) for i, it in enumerate(norm)))
         finally:
             await browser.close()
 
     return [
-        r if r is not None else {
-            "vessel": vessels[i], "status": "failed",
-            "lat": None, "lon": None,
-            "country_ko": None, "cc": None, "nearest_city": None,
-            "location_label": None,
-        }
+        r if r is not None else _empty_result(
+            norm[i]["vessel"], norm[i].get("imo"), "failed",
+            error="결과 누락",
+        )
         for i, r in enumerate(results)
     ]
 
 
 async def open_vessel_location(
-    vessel_name: str, *, headed: bool = True
+    vessel_name: str, *, imo: str | None = None, headed: bool = True
 ) -> dict[str, Any]:
-    """단일 선명 CLI 헬퍼. track_many_locations([name])을 감싼다."""
+    """단일 항목 CLI 헬퍼. IMO가 있으면 직접 조회 사용."""
+    item: dict[str, Any] = {"vessel": vessel_name, "imo": imo}
     results = await track_many_locations(
-        [vessel_name], headless=not headed, concurrency=1
+        [item], headless=not headed, concurrency=1
     )
     return results[0]
 
 
 def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else list(argv)
-    name = args[0] if args else "MONACO MAERSK"
-    result = asyncio.run(open_vessel_location(name, headed=True))
+    imo: str | None = None
+    name: str | None = None
+    i = 0
+    while i < len(args):
+        if args[i] == "--imo" and i + 1 < len(args):
+            imo = args[i + 1]
+            i += 2
+        else:
+            name = args[i]
+            i += 1
+    if not imo and not name:
+        name = "MONACO MAERSK"
+    result = asyncio.run(open_vessel_location(name or "", imo=imo, headed=True))
     for key in (
-        "vessel", "status", "detail_url", "map_url", "lat", "lon",
+        "vessel", "imo", "status", "detail_url", "map_url", "lat", "lon",
         "country_ko", "cc", "nearest_city", "location_label",
     ):
         if key in result:

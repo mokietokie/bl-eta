@@ -56,6 +56,7 @@ SHIPMENT_COLS: list[tuple[str, str]] = [
     ("smelter", "제련소"),
     ("origin", "출항지"),
     ("carrier", "선사"),
+    ("imo", "IMO"),
     ("vessel", "선명"),
     ("bl_no", "BL"),
     ("supply_tons", "공급물량(톤)"),
@@ -95,6 +96,12 @@ def shipments_from_xlsx(data: bytes) -> list[dict]:
         if not bl:
             continue
         rec["bl_no"] = bl
+        # IMO: 엑셀에서 7자리 숫자가 float으로 오기 쉬워 별도 정규화
+        imo_v = rec.get("imo")
+        if isinstance(imo_v, float):
+            imo_v = "" if pd.isna(imo_v) else str(int(imo_v)) if imo_v.is_integer() else str(imo_v)
+        if imo_v is not None:
+            rec["imo"] = str(imo_v).strip() or None
         # 나머지 문자열 필드 trim
         for k in ("smelter", "origin", "carrier", "vessel", "initial_depart_date"):
             if rec.get(k) is not None:
